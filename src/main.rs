@@ -2021,23 +2021,39 @@ mod tests {
         ));
     }
 
+    /// Build a rustlib path from components so the separators follow the host.
+    ///
+    /// A hard-coded `C:\...\self-contained\rcrt1.o` literal is a single opaque
+    /// path component on Unix, because `Path::components` only splits on the
+    /// host platform's separator. Assertions built from that literal held on
+    /// Windows and failed everywhere else.
+    fn rustlib_musl_object(tail: &[&str]) -> OsString {
+        let parts: Vec<&str> = ["root", "lib", "rustlib", "x86_64-unknown-linux-musl", "lib"]
+            .into_iter()
+            .chain(tail.iter().copied())
+            .collect();
+        PathBuf::from_iter(parts).into_os_string()
+    }
+
     #[test]
     fn recognizes_self_contained_crt_objects_without_touching_other_inputs() {
-        assert!(is_self_contained_crt_object(&OsString::from(
-            "C:\\Users\\dev\\.rustup\\toolchains\\stable\\lib\\rustlib\\x86_64-unknown-linux-musl\\lib\\self-contained\\rcrt1.o"
-        )));
-        assert!(is_self_contained_crt_object(&OsString::from(
-            "/home/dev/.rustup/toolchains/stable/lib/rustlib/aarch64-unknown-linux-musl/lib/self-contained/crti.o"
-        )));
-        assert!(is_self_contained_crt_object(&OsString::from(
-            "C:\\sysroot\\Self-Contained\\CRTBEGINS.O".to_ascii_lowercase()
-        )));
-        assert!(!is_self_contained_crt_object(&OsString::from(
-            "D:\\project\\native\\crt1.o"
-        )));
-        assert!(!is_self_contained_crt_object(&OsString::from(
-            "C:\\sysroot\\lib\\rustlib\\x86_64-unknown-linux-musl\\lib\\self-contained\\libc.a"
-        )));
+        assert!(is_self_contained_crt_object(&rustlib_musl_object(&[
+            "self-contained",
+            "rcrt1.o"
+        ])));
+        // The self-contained component and the file name are matched without
+        // regard to ASCII case, which is how Windows paths arrive.
+        assert!(is_self_contained_crt_object(&rustlib_musl_object(&[
+            "Self-Contained",
+            "CRTBEGINS.O"
+        ])));
+        assert!(!is_self_contained_crt_object(&rustlib_musl_object(&[
+            "self-contained",
+            "libc.a"
+        ])));
+        assert!(!is_self_contained_crt_object(&rustlib_musl_object(&[
+            "crt1.o"
+        ])));
         assert!(!is_self_contained_crt_object(&OsString::from(
             "-nostartfiles"
         )));
@@ -2055,9 +2071,10 @@ mod tests {
             OsStr::new("x86_64-linux-musl"),
             &arguments
         ));
+        let crt = rustlib_musl_object(&["self-contained", "rcrt1.o"]);
         fs::write(
             &response,
-            "\"-m64\"\n\"C:\\rust\\sysroot\\lib\\rustlib\\x86_64-unknown-linux-musl\\lib\\self-contained\\rcrt1.o\"\n",
+            format!("\"-m64\"\n\"{}\"\n", Path::new(&crt).display()),
         )
         .unwrap();
         assert!(musl_self_contained_link(
@@ -2080,12 +2097,13 @@ mod tests {
         let directory = root.join("private");
         fs::create_dir_all(&directory).unwrap();
         let response = root.join("link.rsp");
-        let crt = "C:\\rust\\sysroot\\lib\\rustlib\\x86_64-unknown-linux-musl\\lib\\self-contained\\rcrt1.o";
-        let original = format!("\"-m64\"\n\"{crt}\"\n\"-nostartfiles\"\n\"-static-pie\"\n");
+        let crt = rustlib_musl_object(&["self-contained", "rcrt1.o"]);
+        let crt_text = Path::new(&crt).display().to_string();
+        let original = format!("\"-m64\"\n\"{crt_text}\"\n\"-nostartfiles\"\n\"-static-pie\"\n");
         fs::write(&response, &original).unwrap();
         let arguments = vec![
             OsString::from(format!("@{}", response.display())),
-            OsString::from(crt),
+            crt,
             OsString::from("-nostartfiles"),
             OsString::from("-lc"),
         ];
