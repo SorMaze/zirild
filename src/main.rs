@@ -38,11 +38,14 @@ Other options:
   --windows-runtime=<policy>  Windows GNU: auto, zig, or preserve
   --preserve-linker-args      Alias for --windows-runtime=preserve
   --trace                     Print native wrapper invocation details
-  -h, --help                  Show this help
+  -h, --help, help, ?        Show this help
   -V, --version               Print the cargo-zirild version
 
 Cargo command:
   build (default), check, run, test, bench, rustc, clippy, doc, or asm
+
+A bare help, or ?, prints this text instead of building. Like Zirild's options it
+must precede the Cargo command. Quote ? in shells that expand it as a wildcard.
 
 The Cargo command, when present, must precede its Cargo options. Arguments after
 that command are passed to Cargo; Zirild only observes --release and rejects a
@@ -220,7 +223,7 @@ fn driver_request(arguments: &[OsString]) -> Option<DriverRequest> {
         if argument == "zirild" {
             continue;
         }
-        if argument == "--help" || argument == "-h" {
+        if matches!(text.as_ref(), "--help" | "-h" | "help" | "?") {
             return Some(DriverRequest::Help);
         }
         if argument == "--version" || argument == "-V" {
@@ -2308,6 +2311,30 @@ mod tests {
         let version = VERSION.split('.').collect::<Vec<_>>();
         assert!(version.len() >= 3, "unexpected VERSION: {VERSION}");
         assert!(version.iter().all(|piece| !piece.is_empty()));
+    }
+
+    #[test]
+    fn recognizes_bare_help_spellings_ahead_of_the_cargo_command() {
+        for spelling in ["help", "?"] {
+            assert_eq!(
+                driver_request(&[OsString::from(spelling)]),
+                Some(DriverRequest::Help),
+                "a bare {spelling} should request help"
+            );
+            assert_eq!(
+                driver_request(&[
+                    OsString::from("-target=x86_64-unknown-linux-musl"),
+                    OsString::from(spelling)
+                ]),
+                Some(DriverRequest::Help),
+                "{spelling} after a Zirild option should request help"
+            );
+            assert_eq!(
+                driver_request(&[OsString::from("run"), OsString::from(spelling)]),
+                None,
+                "{spelling} after a Cargo command belongs to Cargo"
+            );
+        }
     }
 
     #[test]

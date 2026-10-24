@@ -190,8 +190,11 @@ through unchanged; Zirild does not reserve `-Z`.
 | `--windows-runtime=<policy>` | Windows GNU runtime policy: `auto`, `zig`, or `preserve` |
 | `--preserve-linker-args` | alias for `--windows-runtime=preserve` |
 | `--trace` | print native wrapper invocation details |
-| `-h`, `--help` | show command help |
+| `-h`, `--help`, `help`, `?` | show command help |
 | `-V`, `--version` | print the cargo-zirild version |
+
+The `help` and `?` spellings must precede the Cargo command, like the other
+Zirild options; quote `?` in shells that expand it as a wildcard.
 
 The legacy `-zigpatch=<path>` and `-ZigOptimize=<mode>` spellings remain
 accepted for compatibility.

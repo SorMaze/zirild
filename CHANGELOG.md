@@ -1,7 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.1.10 - 2026-10-25
 
+- Accept a bare `help`, and `?`, as requests for the built-in help. `cargo zirild
+  help` and `cargo zirild ?` now print the usage text instead of forwarding the
+  word to Cargo as a subcommand. Like every other Zirild option they must precede
+  the Cargo command; `?` needs quoting in shells that expand it as a wildcard.
 - Add `-V`/`--version`, which reports the cargo-zirild version without requiring
   `-target`. A Cargo subcommand is expected to answer a version query; the
   previous behavior fell through to Cargo's argument phase and failed with

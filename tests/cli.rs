@@ -39,25 +39,34 @@ fn version_flags_report_the_package_version() {
 
 #[test]
 fn help_lists_every_supported_cargo_command_and_option() {
-    let output = cargo_zirild(&["--help"]);
-    assert!(output.status.success());
-    let help = stdout(&output);
-
-    let commands = help
-        .lines()
-        .find(|line| line.trim_start().starts_with("build (default)"))
-        .expect("help should list the Cargo commands");
-    for command in [
-        "build", "check", "run", "test", "bench", "rustc", "clippy", "doc", "asm",
-    ] {
+    for arguments in [["--help"], ["-h"], ["help"], ["?"]] {
+        let output = cargo_zirild(&arguments);
         assert!(
-            commands.contains(command),
-            "help omits {command}: {commands}"
+            output.status.success(),
+            "{arguments:?} should succeed: {}",
+            stderr(&output)
         );
-    }
+        let help = stdout(&output);
 
-    for option in ["-target=", "--zig-path=", "--version", "--windows-runtime="] {
-        assert!(help.contains(option), "help does not mention {option}");
+        let commands = help
+            .lines()
+            .find(|line| line.trim_start().starts_with("build (default)"))
+            .expect("help should list the Cargo commands");
+        for command in [
+            "build", "check", "run", "test", "bench", "rustc", "clippy", "doc", "asm",
+        ] {
+            assert!(
+                commands.contains(command),
+                "{arguments:?} omits {command}: {commands}"
+            );
+        }
+
+        for option in ["-target=", "--zig-path=", "--version", "--windows-runtime="] {
+            assert!(
+                help.contains(option),
+                "{arguments:?} does not mention {option}"
+            );
+        }
     }
 }
 
