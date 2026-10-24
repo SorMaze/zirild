@@ -1,6 +1,6 @@
 # cargo-zirild
 
-[GitHub repository](https://github.com/Booklight12/zirild)
+[GitHub repository](https://github.com/SorMaze/zirild)
 
 `cargo-zirild` is a Cargo subcommand for building, checking, testing, and
 running Rust projects for a selected target. It creates temporary tool wrappers
