@@ -44,6 +44,19 @@ Other options:
 Cargo command:
   build (default), check, run, test, bench, rustc, clippy, doc, or asm
 
+Build takeover:
+  build-on -target=<zig-target>  Write .cargo/config.toml so a plain `cargo build`
+                                 is a full Zig build: target, C/C++, and final link
+  cxx-on [-target=<zig-target>]  Route only C/C++ and ar through Zig; Cargo keeps
+                                 its own target and linker. Infers the host target
+                                 when -target is omitted
+  build-off, cxx-off             Remove the generated config block
+
+Takeover writes .cargo/config.toml in the project root, which is not meant to be
+committed: it records absolute wrapper paths for this machine. After build-on a
+plain `cargo run` cannot run the cross-compiled result. cxx-on is not enough for
+musl targets, where the final link must also be Zig's; use build-on for those.
+
 A bare help, or ?, prints this text instead of building. Like Zirild's options it
 must precede the Cargo command. Quote ? in shells that expand it as a wildcard.
 
@@ -171,6 +184,12 @@ fn run_driver(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
     if args.first().is_some_and(|argument| argument == "zirild") {
         args.remove(0);
     }
+    // `cargo zirild` on its own is a request for help, not a malformed build:
+    // there is no target to complain about because nothing was asked for.
+    if args.is_empty() {
+        print!("{USAGE}");
+        return Ok(());
+    }
     match driver_request(&args) {
         Some(DriverRequest::Help) => {
             print!("{USAGE}");
@@ -181,6 +200,9 @@ fn run_driver(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
             return Ok(());
         }
         None => {}
+    }
+    if let Some(command) = management_command(&args) {
+        return run_management(command?);
     }
 
     let options = parse_args(args)?;
@@ -234,6 +256,580 @@ fn driver_request(arguments: &[OsString]) -> Option<DriverRequest> {
         }
     }
     None
+}
+
+/// What a takeover command hands to Cargo.
+///
+/// `build-on` owns target selection, native compilation, and the final link.
+/// `cxx-on` owns native compilation only, leaving Cargo's target and linker
+/// alone. See `docs/decisions/0001-build-takeover.md` for why the switch lives
+/// in `.cargo/config.toml` rather than in `Cargo.toml`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TakeoverMode {
+    Build,
+    Cxx,
+}
+
+impl TakeoverMode {
+    fn on_command(self) -> &'static str {
+        match self {
+            Self::Build => "build-on",
+            Self::Cxx => "cxx-on",
+        }
+    }
+
+    fn off_command(self) -> &'static str {
+        match self {
+            Self::Build => "build-off",
+            Self::Cxx => "cxx-off",
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ManagementCommand {
+    Enable {
+        mode: TakeoverMode,
+        target: Option<String>,
+        optimize: String,
+    },
+    Disable {
+        mode: TakeoverMode,
+    },
+}
+
+/// Recognize a takeover command ahead of Cargo argument parsing. Returns `None`
+/// when the arguments are an ordinary build request.
+fn management_command(arguments: &[OsString]) -> Option<Result<ManagementCommand, String>> {
+    let first = arguments.first()?.to_string_lossy().into_owned();
+    let (mode, enable) = match first.as_str() {
+        "build-on" => (TakeoverMode::Build, true),
+        "cxx-on" => (TakeoverMode::Cxx, true),
+        "build-off" => (TakeoverMode::Build, false),
+        "cxx-off" => (TakeoverMode::Cxx, false),
+        _ => return None,
+    };
+    Some(parse_management_arguments(mode, enable, &arguments[1..]))
+}
+
+fn parse_management_arguments(
+    mode: TakeoverMode,
+    enable: bool,
+    arguments: &[OsString],
+) -> Result<ManagementCommand, String> {
+    let mut target = None;
+    let mut optimize = None;
+    for argument in arguments {
+        let text = argument.to_string_lossy();
+        if let Some(value) = text
+            .strip_prefix("-target=")
+            .or_else(|| text.strip_prefix("--target="))
+        {
+            if value.is_empty() {
+                return Err("-target cannot be empty".into());
+            }
+            target = Some(value.to_owned());
+        } else if let Some(value) = text.strip_prefix("--zig-opt=") {
+            optimize = Some(validate_optimize(value)?);
+        } else {
+            let command = if enable {
+                mode.on_command()
+            } else {
+                mode.off_command()
+            };
+            return Err(format!("unexpected argument '{text}' for {command}"));
+        }
+    }
+
+    if !enable {
+        if target.is_some() || optimize.is_some() {
+            return Err(format!("{} takes no options", mode.off_command()));
+        }
+        return Ok(ManagementCommand::Disable { mode });
+    }
+
+    if mode == TakeoverMode::Build && target.is_none() {
+        return Err(
+            "build-on requires -target=<zig-target>; cxx-on can infer the host target".into(),
+        );
+    }
+    Ok(ManagementCommand::Enable {
+        mode,
+        target,
+        // A driver invocation without --release also uses ReleaseSafe, and a
+        // wrapped build cannot observe Cargo's profile, so make it explicit.
+        optimize: optimize.unwrap_or_else(|| "ReleaseSafe".into()),
+    })
+}
+
+fn run_management(command: ManagementCommand) -> Result<(), String> {
+    match command {
+        ManagementCommand::Enable {
+            mode,
+            target,
+            optimize,
+        } => {
+            let target = match target {
+                Some(target) => target,
+                None => host_zig_target()?,
+            };
+            let cargo_target = cargo_target_for(&target);
+            let zig_target = zig_target_for(&target);
+            if is_android_target(&cargo_target) {
+                return Err(
+                    "build takeover does not support Android targets; use `cargo zirild -target=...` for those"
+                        .into(),
+                );
+            }
+            if mode == TakeoverMode::Build && cargo_target.ends_with("-msvc") {
+                return Err(
+                    "build-on does not take over an MSVC target: Zirild leaves the MSVC toolchain in charge there. \
+                     Use cxx-on to route only C/C++ through Zig, or choose a non-MSVC target."
+                        .into(),
+                );
+            }
+            let root = project_root()?;
+            let zig = zig_executable(None)?;
+            let wrappers = persistent_wrappers()?;
+            let config = root.join(".cargo").join("config.toml");
+            let block = takeover_block(
+                mode,
+                &zig_target,
+                &cargo_target,
+                &optimize,
+                &zig.path,
+                &wrappers,
+            );
+            install_takeover_block(&config, &block, mode, &cargo_target)?;
+
+            eprintln!(
+                "cargo-zirild: {} wrote {} (Zig {} / {})",
+                mode.on_command(),
+                config.display(),
+                zig.version,
+                zig_target
+            );
+            eprintln!("  wrappers: {}", wrappers.directory.display());
+            if mode == TakeoverMode::Build {
+                eprintln!(
+                    "  `cargo build` now cross-compiles through Zig; `cargo run` cannot run the result."
+                );
+            } else {
+                eprintln!(
+                    "  `cargo build` now compiles C/C++ through Zig; Cargo keeps its own target and linker."
+                );
+            }
+            if cargo_target.ends_with("-pc-windows-gnu") {
+                eprintln!(
+                    "  note: a Windows GNU link may still need `dlltool` on PATH; takeover cannot prepend the wrapper directory the way a driver invocation does."
+                );
+            }
+            Ok(())
+        }
+        ManagementCommand::Disable { mode } => {
+            let config = project_root()?.join(".cargo").join("config.toml");
+            remove_takeover_block(&config, mode)?;
+            eprintln!(
+                "cargo-zirild: {} removed the managed block from {}",
+                mode.off_command(),
+                config.display()
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Infer the Zig target for the machine running cargo-zirild.
+///
+/// `rustc -vV` is the authority because it distinguishes `windows-msvc` from
+/// `windows-gnu`, which `std::env::consts` cannot.
+fn host_zig_target() -> Result<String, String> {
+    let output = Command::new("rustc")
+        .arg("-vV")
+        .output()
+        .map_err(|err| format!("cannot run rustc to infer the host target: {err}"))?;
+    if !output.status.success() {
+        return Err("rustc -vV failed; pass -target=<zig-target> explicitly".into());
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let host = text
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .ok_or_else(|| {
+            "rustc -vV did not report a host triple; pass -target=<zig-target> explicitly"
+                .to_owned()
+        })?;
+    Ok(zig_target_for(host.trim()))
+}
+
+const TAKEOVER_BLOCK_START: &str = "# >>> cargo-zirild managed block";
+const TAKEOVER_BLOCK_END: &str = "# <<< cargo-zirild managed block <<<";
+
+/// Like `make_wrappers`, but into a machine-wide directory that outlives this
+/// invocation. Takeover configuration can only point at stable paths, and since
+/// the config file is not committed, absolute paths are the intended form.
+fn persistent_wrappers() -> Result<Wrappers, String> {
+    let current = env::current_exe().map_err(|err| format!("cannot locate cargo-zirild: {err}"))?;
+    let directory = takeover_wrapper_directory()?;
+    fs::create_dir_all(&directory).map_err(|err| {
+        format!(
+            "cannot create wrapper directory '{}': {err}",
+            directory.display()
+        )
+    })?;
+
+    let extension = if cfg!(windows) { ".exe" } else { "" };
+    let wrapper = |name: &str| directory.join(format!("cargo-zirild-{name}{extension}"));
+    let cc = wrapper("cc");
+    let cxx = wrapper("cxx");
+    let linker = wrapper("linker");
+    let ar = wrapper("ar");
+    let dlltool = directory.join(format!("dlltool{extension}"));
+    for path in [&cc, &cxx, &linker, &ar, &dlltool] {
+        if path.exists() {
+            continue;
+        }
+        fs::copy(&current, path).map_err(|err| {
+            format!(
+                "cannot create persistent wrapper '{}' from '{}': {err}",
+                path.display(),
+                current.display()
+            )
+        })?;
+    }
+    Ok(Wrappers {
+        directory,
+        cc,
+        cxx,
+        linker,
+        ar,
+    })
+}
+
+fn takeover_wrapper_directory() -> Result<PathBuf, String> {
+    let base = if cfg!(windows) {
+        env::var_os("LOCALAPPDATA").map(PathBuf::from)
+    } else {
+        env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .or_else(|| {
+                env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("share"))
+            })
+    };
+    let base = base.ok_or_else(|| {
+        "cannot determine a data directory for persistent wrappers; set LOCALAPPDATA or XDG_DATA_HOME"
+            .to_owned()
+    })?;
+    Ok(base.join("cargo-zirild").join("wrappers").join(VERSION))
+}
+
+/// Locate the directory whose `.cargo/config.toml` a `cargo build` would read.
+///
+/// In a workspace, writing the block into a member crate would only affect
+/// invocations made from inside that member, so the workspace root wins. With
+/// no workspace, the nearest manifest is the project.
+fn project_root() -> Result<PathBuf, String> {
+    let start = env::current_dir()
+        .map_err(|err| format!("cannot determine the current directory: {err}"))?;
+    project_root_from(&start)
+}
+
+fn project_root_from(start: &Path) -> Result<PathBuf, String> {
+    let mut directory = start.to_path_buf();
+    let mut nearest = None;
+    loop {
+        let manifest = directory.join("Cargo.toml");
+        if manifest.is_file() {
+            if manifest_declares_workspace(&manifest) {
+                return Ok(directory);
+            }
+            if nearest.is_none() {
+                nearest = Some(directory.clone());
+            }
+        }
+        if !directory.pop() {
+            return nearest
+                .ok_or_else(|| "no Cargo.toml found here or in any parent directory".into());
+        }
+    }
+}
+
+fn manifest_declares_workspace(path: &Path) -> bool {
+    fs::read_to_string(path)
+        .map(|text| {
+            text.lines()
+                .any(|line| line.trim().starts_with("[workspace]"))
+        })
+        .unwrap_or(false)
+}
+
+fn takeover_block(
+    mode: TakeoverMode,
+    zig_target: &str,
+    cargo_target: &str,
+    optimize: &str,
+    zig: &Path,
+    wrappers: &Wrappers,
+) -> String {
+    let mut block = String::new();
+    block.push_str(&format!(
+        "{TAKEOVER_BLOCK_START} ({}) — generated by cargo-zirild {VERSION} >>>\n",
+        mode.on_command()
+    ));
+    block.push_str(&format!(
+        "# Remove it with `cargo zirild {}`; edits inside the block are overwritten.\n",
+        mode.off_command()
+    ));
+
+    if mode == TakeoverMode::Build {
+        block.push_str("\n[build]\n");
+        block.push_str(&format!("target = {}\n", toml_string(cargo_target)));
+    }
+
+    block.push_str("\n[env]\n");
+    // Cargo's `[env]` does not override a variable that is already in the
+    // environment unless `force` is set, and a stray `CC` in someone's shell
+    // would otherwise silently defeat the whole takeover. Zirild's own
+    // variables stay unforced so that an explicit `cargo zirild -target=...`
+    // still wins over the recorded default.
+    let mut entries = vec![
+        ("CARGO_ZIRILD_ZIG", zig.display().to_string(), false),
+        ("CARGO_ZIRILD_ZIG_TARGET", zig_target.to_owned(), false),
+        ("CARGO_ZIRILD_OPTIMIZE", optimize.to_owned(), false),
+        ("CC", wrappers.cc.display().to_string(), true),
+        ("CXX", wrappers.cxx.display().to_string(), true),
+    ];
+    // MSVC builds archive with lib.exe and link with link.exe. The driver never
+    // sets AR for an -msvc target either, and cc-rs passes lib.exe's own
+    // argument spelling, which zig ar does not accept.
+    if !cargo_target.ends_with("-msvc") {
+        entries.push(("AR", wrappers.ar.display().to_string(), true));
+    }
+    for (key, value, force) in entries {
+        if force {
+            block.push_str(&format!(
+                "{key} = {{ value = {}, force = true }}\n",
+                toml_string(&value)
+            ));
+        } else {
+            block.push_str(&format!("{key} = {}\n", toml_string(&value)));
+        }
+    }
+
+    if mode == TakeoverMode::Build {
+        let normalized = cargo_target.replace('-', "_").to_ascii_uppercase();
+        block.push_str(&format!(
+            "CARGO_TARGET_{normalized}_AR = {{ value = {}, force = true }}\n",
+            toml_string(&wrappers.ar.display().to_string())
+        ));
+        block.push_str(&format!("\n[target.{cargo_target}]\n"));
+        block.push_str(&format!(
+            "linker = {}\n",
+            toml_string(&wrappers.linker.display().to_string())
+        ));
+    }
+
+    block.push_str(TAKEOVER_BLOCK_END);
+    block.push('\n');
+    block
+}
+
+fn toml_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for character in value.chars() {
+        match character {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn find_takeover_block(lines: &[&str]) -> Option<(usize, usize)> {
+    let start = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with(TAKEOVER_BLOCK_START))?;
+    let end = lines
+        .iter()
+        .enumerate()
+        .skip(start)
+        .find(|(_, line)| line.trim() == TAKEOVER_BLOCK_END)
+        .map(|(index, _)| index)?;
+    Some((start, end))
+}
+
+/// A start marker without its end marker. Treating that as "no block" would
+/// append a second block and leave the file with two conflicting `[env]`
+/// tables, so both the install and the removal path refuse instead.
+fn has_unterminated_takeover_block(lines: &[&str]) -> bool {
+    lines
+        .iter()
+        .any(|line| line.trim_start().starts_with(TAKEOVER_BLOCK_START))
+        && find_takeover_block(lines).is_none()
+}
+
+/// Report a section that the block would duplicate.
+///
+/// TOML rejects a repeated table, and one repeated table makes Cargo reject the
+/// entire config file. Refusing here keeps a convenience command from turning a
+/// project into something that no longer builds.
+fn conflicting_section(lines: &[&str], mode: TakeoverMode, cargo_target: &str) -> Option<String> {
+    let owned = format!("target.{cargo_target}");
+    for line in lines {
+        let Some(section) = line
+            .trim()
+            .strip_prefix('[')
+            .and_then(|rest| rest.split_once(']'))
+            .map(|(name, _)| name.trim().trim_matches(|c| c == '"' || c == '\''))
+        else {
+            continue;
+        };
+        if section == "env" || section.starts_with("env.") {
+            return Some(section.to_owned());
+        }
+        if mode == TakeoverMode::Build {
+            let nested = format!("{owned}.");
+            if section == "build"
+                || section.starts_with("build.")
+                || section == owned
+                || section.starts_with(&nested)
+            {
+                return Some(section.to_owned());
+            }
+        }
+    }
+    None
+}
+
+fn install_takeover_block(
+    path: &Path,
+    block: &str,
+    mode: TakeoverMode,
+    cargo_target: &str,
+) -> Result<(), String> {
+    let existing = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => return Err(format!("cannot read '{}': {err}", path.display())),
+    };
+    let lines: Vec<&str> = existing.lines().collect();
+
+    let updated = match find_takeover_block(&lines) {
+        Some((start, end)) => {
+            let mut out = String::new();
+            for line in &lines[..start] {
+                out.push_str(line);
+                out.push('\n');
+            }
+            out.push_str(block);
+            for line in &lines[end + 1..] {
+                out.push_str(line);
+                out.push('\n');
+            }
+            out
+        }
+        None => {
+            if has_unterminated_takeover_block(&lines) {
+                return Err(format!(
+                    "'{}' starts a cargo-zirild managed block but never closes it; repair the file by hand, then run {} again",
+                    path.display(),
+                    mode.on_command()
+                ));
+            }
+            if let Some(section) = conflicting_section(&lines, mode, cargo_target) {
+                return Err(format!(
+                    "'{}' already defines [{section}]; merge those settings by hand, then run {} again",
+                    path.display(),
+                    mode.on_command()
+                ));
+            }
+            let mut out = existing;
+            if !out.is_empty() {
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push('\n');
+            }
+            out.push_str(block);
+            out
+        }
+    };
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("cannot create '{}': {err}", parent.display()))?;
+    }
+    fs::write(path, updated).map_err(|err| format!("cannot write '{}': {err}", path.display()))
+}
+
+fn remove_takeover_block(path: &Path, mode: TakeoverMode) -> Result<(), String> {
+    let existing = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!(
+                "'{}' does not exist, so {} never ran here",
+                path.display(),
+                mode.on_command()
+            ));
+        }
+        Err(err) => return Err(format!("cannot read '{}': {err}", path.display())),
+    };
+    let lines: Vec<&str> = existing.lines().collect();
+    if has_unterminated_takeover_block(&lines) {
+        return Err(format!(
+            "'{}' starts a cargo-zirild managed block but never closes it; repair the file by hand",
+            path.display()
+        ));
+    }
+    let (start, end) = find_takeover_block(&lines).ok_or_else(|| {
+        format!(
+            "'{}' has no cargo-zirild managed block; run {} first",
+            path.display(),
+            mode.on_command()
+        )
+    })?;
+
+    if !lines[start].contains(&format!("({})", mode.on_command())) {
+        let other = match mode {
+            TakeoverMode::Build => TakeoverMode::Cxx,
+            TakeoverMode::Cxx => TakeoverMode::Build,
+        };
+        return Err(format!(
+            "the managed block was written by {}; run `cargo zirild {}` instead",
+            other.on_command(),
+            other.off_command()
+        ));
+    }
+
+    let mut out = String::new();
+    for line in &lines[..start] {
+        out.push_str(line);
+        out.push('\n');
+    }
+    for line in &lines[end + 1..] {
+        out.push_str(line);
+        out.push('\n');
+    }
+
+    if out.trim().is_empty() {
+        fs::remove_file(path)
+            .map_err(|err| format!("cannot remove '{}': {err}", path.display()))?;
+        if let Some(parent) = path.parent() {
+            // Succeeds only when the directory is empty now, which is the case
+            // this removal just created; a directory holding other files stays.
+            let _ = fs::remove_dir(parent);
+        }
+        Ok(())
+    } else {
+        fs::write(path, out).map_err(|err| format!("cannot write '{}': {err}", path.display()))
+    }
 }
 
 fn is_zirild_option_spelling(argument: &str) -> bool {
@@ -2538,5 +3134,299 @@ mod tests {
             android_musl_target("x86_64-linux-android.24"),
             "x86_64-linux-musl"
         );
+    }
+
+    // ---- build takeover -------------------------------------------------
+
+    fn temp_config(label: &str) -> PathBuf {
+        let root = env::temp_dir().join(format!(
+            "cargo-zirild-takeover-{label}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        root.join(".cargo").join("config.toml")
+    }
+
+    fn sample_wrappers() -> Wrappers {
+        Wrappers {
+            directory: PathBuf::from(r"C:\w"),
+            cc: PathBuf::from(r"C:\w\cargo-zirild-cc.exe"),
+            cxx: PathBuf::from(r"C:\w\cargo-zirild-cxx.exe"),
+            linker: PathBuf::from(r"C:\w\cargo-zirild-linker.exe"),
+            ar: PathBuf::from(r"C:\w\cargo-zirild-ar.exe"),
+        }
+    }
+
+    fn sample_block(mode: TakeoverMode) -> String {
+        takeover_block(
+            mode,
+            "x86_64-linux-gnu",
+            "x86_64-unknown-linux-gnu",
+            "ReleaseSafe",
+            Path::new(r"C:\zig\zig.exe"),
+            &sample_wrappers(),
+        )
+    }
+
+    #[test]
+    fn recognizes_the_four_takeover_commands() {
+        assert!(matches!(
+            management_command(&[
+                OsString::from("build-on"),
+                OsString::from("-target=x86_64-linux-gnu")
+            ]),
+            Some(Ok(ManagementCommand::Enable {
+                mode: TakeoverMode::Build,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            management_command(&[OsString::from("cxx-on")]),
+            Some(Ok(ManagementCommand::Enable {
+                mode: TakeoverMode::Cxx,
+                target: None,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            management_command(&[OsString::from("build-off")]),
+            Some(Ok(ManagementCommand::Disable {
+                mode: TakeoverMode::Build
+            }))
+        ));
+        assert!(matches!(
+            management_command(&[OsString::from("cxx-off")]),
+            Some(Ok(ManagementCommand::Disable {
+                mode: TakeoverMode::Cxx
+            }))
+        ));
+        assert!(management_command(&[OsString::from("build")]).is_none());
+        assert!(management_command(&[OsString::from("-target=x86_64-linux-gnu")]).is_none());
+    }
+
+    #[test]
+    fn takeover_commands_validate_their_options() {
+        assert!(
+            management_command(&[OsString::from("build-on")])
+                .unwrap()
+                .is_err()
+        );
+        assert!(
+            management_command(&[
+                OsString::from("build-off"),
+                OsString::from("-target=x86_64-linux-gnu")
+            ])
+            .unwrap()
+            .is_err()
+        );
+        assert!(
+            management_command(&[OsString::from("cxx-on"), OsString::from("--release")])
+                .unwrap()
+                .is_err()
+        );
+        let optimized = management_command(&[
+            OsString::from("cxx-on"),
+            OsString::from("--zig-opt=ReleaseFast"),
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(optimized, ManagementCommand::Enable { optimize, .. } if optimize == "ReleaseFast")
+        );
+    }
+
+    #[test]
+    fn takeover_block_separates_build_and_cxx_modes() {
+        let build = sample_block(TakeoverMode::Build);
+        assert!(build.contains("[build]"));
+        assert!(build.contains("target = \"x86_64-unknown-linux-gnu\""));
+        assert!(build.contains("[target.x86_64-unknown-linux-gnu]"));
+        assert!(build.contains(r#"linker = "C:\\w\\cargo-zirild-linker.exe""#));
+        assert!(build.contains("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_AR"));
+        assert!(build.starts_with(TAKEOVER_BLOCK_START));
+        assert!(build.trim_end().ends_with(TAKEOVER_BLOCK_END));
+
+        let cxx = sample_block(TakeoverMode::Cxx);
+        assert!(!cxx.contains("[build]"));
+        assert!(!cxx.contains("linker ="));
+        assert!(cxx.contains(r#"CC = { value = "C:\\w\\cargo-zirild-cc.exe", force = true }"#));
+        assert!(cxx.contains("CARGO_ZIRILD_ZIG_TARGET = \"x86_64-linux-gnu\""));
+        assert!(
+            !cxx.contains("CARGO_ZIRILD_ZIG_TARGET = {"),
+            "Zirild's own variables must stay unforced so `cargo zirild -target=` wins"
+        );
+    }
+
+    #[test]
+    fn takeover_refuses_a_nested_env_table() {
+        let config = temp_config("nested-env");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let original = "[env.extra]\nvalue = \"x\"\n";
+        fs::write(&config, original).unwrap();
+
+        let error = install_takeover_block(
+            &config,
+            &sample_block(TakeoverMode::Cxx),
+            TakeoverMode::Cxx,
+            "x86_64-unknown-linux-gnu",
+        )
+        .unwrap_err();
+        assert!(error.contains("[env.extra]"), "unexpected error: {error}");
+        assert_eq!(fs::read_to_string(&config).unwrap(), original);
+    }
+
+    #[test]
+    fn takeover_refuses_an_unterminated_block() {
+        let config = temp_config("unterminated");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(
+            &config,
+            format!("{TAKEOVER_BLOCK_START} (build-on) - hand edited\n[env]\n"),
+        )
+        .unwrap();
+
+        let install_error = install_takeover_block(
+            &config,
+            &sample_block(TakeoverMode::Build),
+            TakeoverMode::Build,
+            "x86_64-unknown-linux-gnu",
+        )
+        .unwrap_err();
+        assert!(
+            install_error.contains("never closes it"),
+            "unexpected install error: {install_error}"
+        );
+
+        let remove_error = remove_takeover_block(&config, TakeoverMode::Build).unwrap_err();
+        assert!(
+            remove_error.contains("never closes it"),
+            "unexpected remove error: {remove_error}"
+        );
+    }
+
+    #[test]
+    fn project_root_prefers_a_workspace_manifest() {
+        let root = env::temp_dir().join(format!("cargo-zirild-workspace-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let member = root.join("member");
+        fs::create_dir_all(member.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"member\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname = \"member\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(project_root_from(&member).unwrap(), root);
+        assert_eq!(project_root_from(&root).unwrap(), root);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn takeover_block_is_idempotent_and_reversible() {
+        let config = temp_config("idempotent");
+        let block = sample_block(TakeoverMode::Build);
+        install_takeover_block(
+            &config,
+            &block,
+            TakeoverMode::Build,
+            "x86_64-unknown-linux-gnu",
+        )
+        .unwrap();
+        let first = fs::read_to_string(&config).unwrap();
+
+        install_takeover_block(
+            &config,
+            &block,
+            TakeoverMode::Build,
+            "x86_64-unknown-linux-gnu",
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(&config).unwrap(),
+            first,
+            "re-running must replace the block, not append a second copy"
+        );
+
+        remove_takeover_block(&config, TakeoverMode::Build).unwrap();
+        assert!(
+            !config.exists(),
+            "a config that only held the block should be removed"
+        );
+    }
+
+    #[test]
+    fn takeover_refuses_to_duplicate_an_existing_section() {
+        let config = temp_config("conflict");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let original = "[env]\nCC = \"gcc\"\n";
+        fs::write(&config, original).unwrap();
+
+        let error = install_takeover_block(
+            &config,
+            &sample_block(TakeoverMode::Build),
+            TakeoverMode::Build,
+            "x86_64-unknown-linux-gnu",
+        )
+        .unwrap_err();
+        assert!(error.contains("[env]"), "unexpected error: {error}");
+        assert_eq!(
+            fs::read_to_string(&config).unwrap(),
+            original,
+            "a refused write must leave the file untouched"
+        );
+    }
+
+    #[test]
+    fn takeover_preserves_unrelated_configuration() {
+        let config = temp_config("preserve");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let original = "[net]\ngit-fetch-with-cli = true\n";
+        fs::write(&config, original).unwrap();
+
+        install_takeover_block(
+            &config,
+            &sample_block(TakeoverMode::Cxx),
+            TakeoverMode::Cxx,
+            "x86_64-unknown-linux-gnu",
+        )
+        .unwrap();
+        let after = fs::read_to_string(&config).unwrap();
+        assert!(after.starts_with(original));
+        assert!(after.contains(TAKEOVER_BLOCK_START));
+
+        remove_takeover_block(&config, TakeoverMode::Cxx).unwrap();
+        assert_eq!(fs::read_to_string(&config).unwrap().trim(), original.trim());
+    }
+
+    #[test]
+    fn takeover_off_refuses_to_remove_the_other_mode() {
+        let config = temp_config("mode");
+        install_takeover_block(
+            &config,
+            &sample_block(TakeoverMode::Cxx),
+            TakeoverMode::Cxx,
+            "x86_64-unknown-linux-gnu",
+        )
+        .unwrap();
+
+        let error = remove_takeover_block(&config, TakeoverMode::Build).unwrap_err();
+        assert!(error.contains("cxx-off"), "unexpected error: {error}");
+        assert!(
+            config.exists(),
+            "a refused removal must leave the block in place"
+        );
+    }
+
+    #[test]
+    fn escapes_values_for_toml_basic_strings() {
+        assert_eq!(toml_string(r"C:\zig"), r#""C:\\zig""#);
+        assert_eq!(toml_string("a\"b"), r#""a\"b""#);
+        assert_eq!(toml_string("line\nbreak"), r#""line\nbreak""#);
     }
 }

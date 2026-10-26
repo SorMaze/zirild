@@ -61,7 +61,15 @@ fn help_lists_every_supported_cargo_command_and_option() {
             );
         }
 
-        for option in ["-target=", "--zig-path=", "--version", "--windows-runtime="] {
+        for option in [
+            "-target=",
+            "--zig-path=",
+            "--version",
+            "--windows-runtime=",
+            "build-on",
+            "cxx-on",
+            "build-off",
+        ] {
             assert!(
                 help.contains(option),
                 "{arguments:?} does not mention {option}"
@@ -71,8 +79,49 @@ fn help_lists_every_supported_cargo_command_and_option() {
 }
 
 #[test]
+fn takeover_commands_reject_incomplete_arguments() {
+    let missing_target = cargo_zirild(&["build-on"]);
+    assert!(!missing_target.status.success());
+    assert!(stderr(&missing_target).contains("build-on requires -target="));
+
+    let stray_option = cargo_zirild(&["build-off", "-target=x86_64-linux-gnu"]);
+    assert!(!stray_option.status.success());
+    assert!(stderr(&stray_option).contains("takes no options"));
+}
+
+#[test]
+fn build_on_refuses_msvc_targets_before_touching_the_project() {
+    let output = cargo_zirild(&["build-on", "-target=x86_64-pc-windows-msvc"]);
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("does not take over an MSVC target"));
+}
+
+#[test]
+fn a_bare_invocation_prints_help_instead_of_a_missing_target_error() {
+    // Cargo passes the subcommand name through, so `cargo zirild` arrives as a
+    // single "zirild" argument.
+    for arguments in [Vec::new(), vec!["zirild"]] {
+        let output = cargo_zirild(&arguments);
+        assert!(
+            output.status.success(),
+            "{arguments:?} should succeed: {}",
+            stderr(&output)
+        );
+        let help = stdout(&output);
+        assert!(
+            help.starts_with("cargo-zirild - run Cargo commands"),
+            "{arguments:?} did not print help: {help}"
+        );
+        assert!(
+            !stderr(&output).contains("missing required -target="),
+            "{arguments:?} should not complain about a target"
+        );
+    }
+}
+
+#[test]
 fn a_missing_target_is_rejected() {
-    let output = cargo_zirild(&["zirild"]);
+    let output = cargo_zirild(&["build"]);
     assert!(!output.status.success());
     assert!(stderr(&output).contains("missing required -target="));
 }

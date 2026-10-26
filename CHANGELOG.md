@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.2.0 - 2026-10-27
+
+- Print the built-in help when `cargo zirild` runs with no arguments. It used to
+  fail with `missing required -target=<zig-target>`, which answered a question
+  nobody had asked.
+- Add build takeover, so a plain `cargo build` can use Zig without repeating a
+  target on every command or configuring `CC`, `CXX`, `AR`, and the linker.
+  - `cargo zirild build-on -target=<target>` makes a bare `cargo build` a full
+    Zig cross build: target selection, C/C++, and the final link.
+  - `cargo zirild cxx-on [-target=<target>]` routes only C/C++ and `ar` through
+    Zig; Cargo keeps its own target and linker. Without `-target` the host
+    target is inferred from `rustc -vV`.
+  - `build-off` and `cxx-off` remove the generated block. A config file that
+    only held the block is deleted.
+
+  The switch lives in `.cargo/config.toml`, not in `Cargo.toml`: Cargo does not
+  read manifest data to change its own toolchain, and `cargo-zirild` cannot read
+  project config through Cargo's environment. The block is delimited and
+  replaced on re-run; a pre-existing `[env]`, `[build]`, or `[target.<triple>]`
+  section is refused rather than duplicated, because a repeated TOML table
+  makes Cargo reject the whole file. Nothing needs a TOML parser, so the crate
+  keeps its zero-dependency property. See
+  `docs/decisions/0001-build-takeover.md`.
+
+  The configuration records absolute wrapper paths under the platform data
+  directory and is not meant to be committed. `build-on` rejects MSVC and
+  Android targets, and `cxx-on` is insufficient for musl targets where the
+  final link must also be Zig's.
+
 ## 0.1.10 - 2026-10-25
 
 - Accept a bare `help`, and `?`, as requests for the built-in help. `cargo zirild

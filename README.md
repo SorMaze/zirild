@@ -95,6 +95,42 @@ example, `x86_64-windows-gnu` maps to `x86_64-pc-windows-gnu`, while the short
 Do not pass Cargo's `--target`; Zirild's `-target` is the single source of truth
 and is converted to the corresponding Rust target triple.
 
+## Build takeover
+
+Two commands write a managed block into `.cargo/config.toml` so that a plain
+`cargo build` goes through Zig without naming a target or setting `CC`:
+
+```powershell
+# A plain `cargo build` becomes a full Zig cross build: target, C/C++, and link.
+cargo zirild build-on -target=x86_64-unknown-linux-gnu
+
+# Only C/C++ and ar go through Zig. Cargo keeps its own target and linker.
+# Without -target, the host target is inferred from `rustc -vV`.
+cargo zirild cxx-on
+
+cargo zirild build-off   # or cxx-off
+```
+
+The block is delimited and Zirild owns it: re-running replaces it, and the off
+command removes it, deleting the file when the block was all it contained. If
+the file already defines a section the block needs (`[env]`, or `[build]` and
+`[target.<triple>]` for `build-on`), Zirild refuses and leaves the file
+untouched, because a duplicate table would make Cargo reject the entire file.
+
+The configuration is **not meant to be committed**: it records absolute wrapper
+paths for this machine, under `%LOCALAPPDATA%\cargo-zirild\wrappers\<version>`
+(on Unix, `$XDG_DATA_HOME` or `~/.local/share`). Run the command once per
+machine. Two limits follow from the design:
+
+- After `build-on`, `cargo run` cannot execute the cross-compiled result.
+- `cxx-on` is not enough for musl targets, where the final link must also be
+  Zig's; use `build-on` for those.
+
+`build-on` rejects MSVC and Android targets. MSVC keeps its own toolchain by
+policy, and Android needs NDK selection on every invocation. The reasoning and
+the measurements behind it are recorded in
+[`docs/decisions/0001-build-takeover.md`](docs/decisions/0001-build-takeover.md).
+
 ## Target triple support
 
 The tables below distinguish real end-to-end validation from code paths that
@@ -177,6 +213,23 @@ After the command, Zirild no longer guesses whether an argument value such as
 `run` is another command. If the command is omitted, the first non-Zirild
 argument starts the default `build` arguments. Cargo's `-Z <feature>` is passed
 through unchanged; Zirild does not reserve `-Z`.
+
+### Takeover commands
+
+These replace the build entry point instead of running Cargo. They accept no
+options beyond `-target` and `--zig-opt`.
+
+| Command | Meaning |
+| --- | --- |
+| `build-on -target=<target>` | write `[build] target`, `[env]`, and `[target.<triple>] linker` so a plain `cargo build` is a full Zig build |
+| `cxx-on [-target=<target>]` | write only `[env]`, routing C/C++ and `ar` through Zig |
+| `build-off` | remove the managed block written by `build-on` |
+| `cxx-off` | remove the managed block written by `cxx-on` |
+
+`--zig-opt=<mode>` is accepted by the `-on` commands and becomes the
+optimisation mode recorded in the environment. A wrapped build cannot observe
+Cargo's profile, so after takeover `cargo build --release` does not change the
+Zig mode; set it when writing the block.
 
 ### General options
 
